@@ -21,9 +21,21 @@
 //! マリオシリーズ楽曲の転用ではなく、8bit・軽快なテンポという曲想のみを
 //! 参考にした新規オリジナル曲。
 //!
+//! 追加ギミック(ユーザー指示、2026-08-10「マリオはキャラクターも作って
+//! 構造物と当たり判定を作って亀を敵にして」「全画面表示、操作説明を下側に
+//! 英日で」への対応):
+//! - 亀の敵(緑)が地面を徘徊し、上から踏むと撃破・側面に当たると自機が
+//!   開始位置へ戻される(接触後は`TURTLE_HIT_COOLDOWN_FRAMES`フレームの
+//!   無敵時間)。
+//! - 全画面表示(ボーダーレスフルスクリーン)。
+//! - 画面下にHUDバナー(英文、自作5x7ビットマップフォント、`font.rs`)で
+//!   操作説明を常時表示。日本語の操作説明はコンソール出力で対応する
+//!   (日本語グリフは用意していない、正直な開示)。
+//!
 //! 実行方法: `cargo run --release`
 
 mod audio;
+mod font;
 
 use std::ffi::CString;
 
@@ -34,9 +46,6 @@ use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use winit::event::{ElementState, Event, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
-
-const WIDTH: u32 = 640;
-const HEIGHT: u32 = 480;
 
 const GRAVITY: f32 = -0.0022;
 const JUMP_VELOCITY: f32 = 0.045;
@@ -66,6 +75,30 @@ struct Fireball {
 
 impl Fireball {
     const INACTIVE: Fireball = Fireball { active: false, x: 0.0, y: 0.0 };
+}
+
+const TURTLE_COUNT: usize = 2;
+const TURTLE_HALF: f32 = 0.05;
+const TURTLE_SPEED: f32 = 0.006;
+const TURTLE_HIT_COOLDOWN_FRAMES: u32 = 60;
+
+#[derive(Clone, Copy)]
+struct Turtle {
+    alive: bool,
+    x: f32,
+    range_x0: f32,
+    range_x1: f32,
+    dir: f32,
+}
+
+impl Turtle {
+    fn new(range_x0: f32, range_x1: f32) -> Self {
+        Turtle { alive: true, x: (range_x0 + range_x1) * 0.5, range_x0, range_x1, dir: 1.0 }
+    }
+
+    fn y(&self) -> f32 {
+        GROUND_TOP - TURTLE_HALF
+    }
 }
 
 #[repr(C)]
@@ -98,6 +131,8 @@ struct GameState {
     fireballs: [Fireball; MAX_FIREBALLS],
     boss_hp: f32,
     boss_defeats: u32,
+    turtles: [Turtle; TURTLE_COUNT],
+    turtle_hit_cooldown: u32,
 }
 
 impl GameState {
@@ -114,6 +149,8 @@ impl GameState {
             fire_held: false,
             fire_cooldown: 0,
             fireballs: [Fireball::INACTIVE; MAX_FIREBALLS],
+            turtles: [Turtle::new(-0.65, -0.2), Turtle::new(0.55, 0.75)],
+            turtle_hit_cooldown: 0,
             boss_hp: BOSS_MAX_HP,
             boss_defeats: 0,
         }
@@ -155,6 +192,50 @@ impl GameState {
         }
 
         self.jump_held = false;
+
+        // 亀の徘徊(左右往復)+自機との当たり判定(上から踏むと撃破、
+        // 側面/下から当たると自機が開始位置へ戻る、被弾直後は無敵時間)。
+        self.turtle_hit_cooldown = self.turtle_hit_cooldown.saturating_sub(1);
+        let player_falling = self.vel_y < 0.0;
+        let mut player_hurt = false;
+        for turtle in self.turtles.iter_mut() {
+            if !turtle.alive {
+                continue;
+            }
+            turtle.x += TURTLE_SPEED * turtle.dir;
+            if turtle.x <= turtle.range_x0 {
+                turtle.x = turtle.range_x0;
+                turtle.dir = 1.0;
+            } else if turtle.x >= turtle.range_x1 {
+                turtle.x = turtle.range_x1;
+                turtle.dir = -1.0;
+            }
+
+            let dx = (self.player_x - turtle.x).abs();
+            let overlap_x = dx < PLAYER_HALF + TURTLE_HALF;
+            let player_feet = self.player_y + PLAYER_HALF;
+            let turtle_top = turtle.y() - TURTLE_HALF;
+            let turtle_bottom = turtle.y() + TURTLE_HALF;
+            let overlap_y = player_feet > turtle_top && self.player_y - PLAYER_HALF < turtle_bottom;
+            if overlap_x && overlap_y {
+                if player_falling && player_feet - turtle_top < TURTLE_HALF {
+                    // 上から踏んで撃破、軽くバウンドさせる。
+                    turtle.alive = false;
+                    self.vel_y = JUMP_VELOCITY * 0.6;
+                    println!("亀を撃破!");
+                } else if self.turtle_hit_cooldown == 0 {
+                    player_hurt = true;
+                }
+            }
+        }
+        if player_hurt {
+            self.turtle_hit_cooldown = TURTLE_HIT_COOLDOWN_FRAMES;
+            println!("亀に接触してダメージ! 開始位置へ戻ります");
+            self.player_x = -0.85;
+            self.player_y = GROUND_TOP - PLAYER_HALF;
+            self.vel_y = 0.0;
+            self.on_ground = true;
+        }
 
         // 火の玉の発射(Fキー)。クールダウン中・空きスロットが無ければ無視。
         if self.fire_held && self.fire_cooldown == 0 {
@@ -237,13 +318,25 @@ impl GameState {
         }
         [f.x - 0.025, f.y - 0.025, f.x + 0.025, f.y + 0.025]
     }
+
+    fn turtle_dest_ndc(&self, i: usize) -> [f32; 4] {
+        let t = &self.turtles[i];
+        if !t.alive {
+            return [-2.0, -2.0, -1.9, -1.9];
+        }
+        let y = t.y();
+        [t.x - TURTLE_HALF, y - TURTLE_HALF, t.x + TURTLE_HALF, y + TURTLE_HALF]
+    }
 }
 
 fn main() {
+    println!("=== sample-mario 操作方法 ===");
+    println!("矢印キー/AD: 左右移動   Space/Up: ジャンプ   F: 火の玉発射   Esc または ウィンドウのXボタン: 終了");
+
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("sample-mario: 2D platformer prototype (Phase 0)")
-        .with_inner_size(winit::dpi::LogicalSize::new(WIDTH, HEIGHT))
+        .with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)))
         .build(&event_loop)
         .expect("create window");
 
@@ -309,6 +402,8 @@ struct Renderer {
     boss_descriptor_set: vk::DescriptorSet,
     boss_hp_descriptor_set: vk::DescriptorSet,
     fireball_descriptor_set: vk::DescriptorSet,
+    turtle_descriptor_set: vk::DescriptorSet,
+    hud_descriptor_set: vk::DescriptorSet,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
     command_pool: vk::CommandPool,
@@ -323,16 +418,24 @@ struct Renderer {
     _boss_texture_image: vk::Image,
     _boss_hp_texture_image: vk::Image,
     _fireball_texture_image: vk::Image,
+    _turtle_texture_image: vk::Image,
+    _hud_texture_image: vk::Image,
     sampler: vk::Sampler,
 }
 
 /// 固定スプライト(地面・足場・自機・ゴール旗・ボス・ボスHPバー)
-/// +火の玉`MAX_FIREBALLS`発を毎フレーム描画する。
+/// +火の玉`MAX_FIREBALLS`発+亀`TURTLE_COUNT`匹+HUDバナー1枚を
+/// 毎フレーム描画する。
 const FIXED_SPRITE_COUNT: usize = 6;
-const DRAWN_SPRITE_COUNT: usize = FIXED_SPRITE_COUNT + MAX_FIREBALLS;
-/// 一意のテクスチャ数(固定6種+火の玉)。
-const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 1;
+const FIREBALL_SPRITE_OFFSET: usize = FIXED_SPRITE_COUNT;
+const TURTLE_SPRITE_OFFSET: usize = FIREBALL_SPRITE_OFFSET + MAX_FIREBALLS;
+const HUD_SPRITE_INDEX: usize = TURTLE_SPRITE_OFFSET + TURTLE_COUNT;
+const DRAWN_SPRITE_COUNT: usize = HUD_SPRITE_INDEX + 1;
+/// 一意のテクスチャ数(固定6種+火の玉+亀+HUDバナー)。
+const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 3;
 const VERTS_PER_SPRITE: usize = 6;
+const HUD_TEXT: &str = "ARROWS/WASD MOVE  SPACE/UP JUMP  F FIRE  ESC/X CLOSE";
+const HUD_HEIGHT_NDC: f32 = 0.08;
 
 impl Renderer {
     unsafe fn new(window: &winit::window::Window) -> Result<Self, String> {
@@ -384,7 +487,8 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_formats[0]);
         let present_mode = vk::PresentModeKHR::FIFO;
-        let extent = vk::Extent2D { width: WIDTH, height: HEIGHT };
+        let window_size = window.inner_size();
+        let extent = vk::Extent2D { width: window_size.width.max(1), height: window_size.height.max(1) };
         let image_count = (surface_caps.min_image_count + 1).min(if surface_caps.max_image_count > 0 { surface_caps.max_image_count } else { u32::MAX });
 
         let swapchain_info = vk::SwapchainCreateInfoKHR::builder()
@@ -469,6 +573,9 @@ impl Renderer {
         let (boss_image, boss_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 40, g: 110, b: 60, a: 255 })?;
         let (boss_hp_image, boss_hp_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 220, g: 50, b: 50, a: 255 })?;
         let (fireball_image, fireball_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 255, g: 130, b: 20, a: 255 })?;
+        let (turtle_image, turtle_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 60, g: 170, b: 70, a: 255 })?;
+        let hud_texture = font::render_text_banner(HUD_TEXT, 3, Rgba8 { r: 255, g: 255, b: 255, a: 255 }, Rgba8 { r: 10, g: 10, b: 15, a: 255 });
+        let (hud_image, hud_view) = create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &hud_texture)?;
 
         let sampler_info = vk::SamplerCreateInfo::builder().mag_filter(vk::Filter::NEAREST).min_filter(vk::Filter::NEAREST);
         let sampler = device.create_sampler(&sampler_info, None).map_err(|e| e.to_string())?;
@@ -499,7 +606,9 @@ impl Renderer {
             boss_descriptor_set,
             boss_hp_descriptor_set,
             fireball_descriptor_set,
-        ) = (sets[0], sets[1], sets[2], sets[3], sets[4], sets[5], sets[6]);
+            turtle_descriptor_set,
+            hud_descriptor_set,
+        ) = (sets[0], sets[1], sets[2], sets[3], sets[4], sets[5], sets[6], sets[7], sets[8]);
 
         for (set, view) in [
             (ground_descriptor_set, ground_view),
@@ -509,6 +618,8 @@ impl Renderer {
             (boss_descriptor_set, boss_view),
             (boss_hp_descriptor_set, boss_hp_view),
             (fireball_descriptor_set, fireball_view),
+            (turtle_descriptor_set, turtle_view),
+            (hud_descriptor_set, hud_view),
         ] {
             let image_info = vk::DescriptorImageInfo::builder()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -629,6 +740,8 @@ impl Renderer {
             boss_descriptor_set,
             boss_hp_descriptor_set,
             fireball_descriptor_set,
+            turtle_descriptor_set,
+            hud_descriptor_set,
             vertex_buffer,
             vertex_buffer_memory,
             command_pool,
@@ -643,6 +756,8 @@ impl Renderer {
             _boss_texture_image: boss_image,
             _boss_hp_texture_image: boss_hp_image,
             _fireball_texture_image: fireball_image,
+            _turtle_texture_image: turtle_image,
+            _hud_texture_image: hud_image,
             sampler,
         })
     }
@@ -665,8 +780,12 @@ impl Renderer {
         sprites_ndc[4] = state.boss_dest_ndc();
         sprites_ndc[5] = state.boss_hp_bar_ndc();
         for i in 0..MAX_FIREBALLS {
-            sprites_ndc[FIXED_SPRITE_COUNT + i] = state.fireball_dest_ndc(i);
+            sprites_ndc[FIREBALL_SPRITE_OFFSET + i] = state.fireball_dest_ndc(i);
         }
+        for i in 0..TURTLE_COUNT {
+            sprites_ndc[TURTLE_SPRITE_OFFSET + i] = state.turtle_dest_ndc(i);
+        }
+        sprites_ndc[HUD_SPRITE_INDEX] = [-1.0, 1.0 - HUD_HEIGHT_NDC, 1.0, 1.0];
         let mut all_verts = [Vertex { pos: [0.0; 3], uv: [0.0; 2] }; DRAWN_SPRITE_COUNT * VERTS_PER_SPRITE];
         for (i, ndc) in sprites_ndc.iter().enumerate() {
             let verts = quad_vertices(*ndc);
@@ -700,8 +819,12 @@ impl Renderer {
         sets[4] = self.boss_descriptor_set;
         sets[5] = self.boss_hp_descriptor_set;
         for i in 0..MAX_FIREBALLS {
-            sets[FIXED_SPRITE_COUNT + i] = self.fireball_descriptor_set;
+            sets[FIREBALL_SPRITE_OFFSET + i] = self.fireball_descriptor_set;
         }
+        for i in 0..TURTLE_COUNT {
+            sets[TURTLE_SPRITE_OFFSET + i] = self.turtle_descriptor_set;
+        }
+        sets[HUD_SPRITE_INDEX] = self.hud_descriptor_set;
         for (i, &set) in sets.iter().enumerate() {
             self.device.cmd_bind_descriptor_sets(self.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, 0, &[set], &[]);
             self.device.cmd_draw(self.command_buffer, VERTS_PER_SPRITE as u32, 1, (i * VERTS_PER_SPRITE) as u32, 0);
@@ -790,21 +913,34 @@ unsafe fn create_solid_texture(
     queue_family_index: u32,
     color: Rgba8,
 ) -> Result<(vk::Image, vk::ImageView), String> {
-    let texture = TextureRgba8 { width: 1, height: 1, pixels: vec![color] };
-    const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+    create_texture_from_rgba(device, memory_properties, queue, queue_family_index, &TextureRgba8 { width: 1, height: 1, pixels: vec![color] })
+}
 
-    let tex_bytes_size = 4u64;
+/// 任意サイズのRGBA8テクスチャを実際にアップロードする(`create_solid_texture`
+/// の1x1専用実装を一般化したもの、HUDバナー画像等の任意画像に使う)。
+unsafe fn create_texture_from_rgba(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    texture: &TextureRgba8,
+) -> Result<(vk::Image, vk::ImageView), String> {
+    const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+    let (width, height) = (texture.width, texture.height);
+
+    let tex_bytes_size = (width as u64) * (height as u64) * 4;
     let (staging_buffer, staging_memory) = create_host_visible_buffer(device, memory_properties, tex_bytes_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
     let ptr = device.map_memory(staging_memory, 0, tex_bytes_size, vk::MemoryMapFlags::empty()).map_err(|e| e.to_string())?;
-    let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, 4);
-    let p = texture.pixels[0];
-    dst.copy_from_slice(&[p.r, p.g, p.b, p.a]);
+    let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, tex_bytes_size as usize);
+    for (i, p) in texture.pixels.iter().enumerate() {
+        dst[i * 4..i * 4 + 4].copy_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
     device.unmap_memory(staging_memory);
 
     let image_info = vk::ImageCreateInfo::builder()
         .image_type(vk::ImageType::TYPE_2D)
         .format(FORMAT)
-        .extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
+        .extent(vk::Extent3D { width, height, depth: 1 })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
@@ -848,7 +984,7 @@ unsafe fn create_solid_texture(
         buffer_image_height: 0,
         image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
         image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-        image_extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+        image_extent: vk::Extent3D { width, height, depth: 1 },
     };
     device.cmd_copy_buffer_to_image(cmd, staging_buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy_region]);
     let to_read = vk::ImageMemoryBarrier::builder()
