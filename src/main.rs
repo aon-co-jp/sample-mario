@@ -4,13 +4,26 @@
 //!
 //! **正直な開示(現在のスコープ)**: 重力+ジャンプ+地面/床の当たり判定+
 //! ゴール到達判定という最小限のプラットフォーマー要素のみ。複数ステージ・
-//! 敵・アイテム・スクロールする広いマップは未実装(次回以降のロードマップ)。
+//! スクロールする広いマップは未実装(次回以降のロードマップ)。
 //!
 //! 内容: 640x480ウィンドウ。地面(緑)+浮いた足場1枚(茶)+自機(赤)+
-//! ゴール旗(黄)。矢印キー/AD左右移動、Space/Upでジャンプ。ゴールに
-//! 到達すると"CLEAR!"をログ出力し自機を開始位置へ戻す(簡易ループ)。
+//! ゴール旗(黄)+ボス(甲羅の魔竜王、独自デザイン)。矢印キー/AD左右
+//! 移動、Space/Upでジャンプ、Fキーで火の玉を発射してボスを攻撃できる
+//! (ユーザー指示、2026-08-10「マリオ風キャラが炎で(ボスを)攻撃出来ると
+//! 良い」への対応)。ゴールに到達すると"CLEAR!"をログ出力し自機を開始
+//! 位置へ戻す(簡易ループ)。BGMは既存楽曲の再現ではなく、8bit風の
+//! オリジナル曲(`audio.rs`)をループ再生する。
+//!
+//! **著作権上の注意(正直な開示)**: 「クッパ」はNintendoの登録商標・
+//! キャラクターであり、その名称・意匠を再現することはできないため、
+//! ここでは"甲羅を持つ魔竜王"という独自デザインのボスとして実装している
+//! (見た目は単色スプライトのプレースホルダー、Phase 0)。BGMも実際の
+//! マリオシリーズ楽曲の転用ではなく、8bit・軽快なテンポという曲想のみを
+//! 参考にした新規オリジナル曲。
 //!
 //! 実行方法: `cargo run --release`
+
+mod audio;
 
 use std::ffi::CString;
 
@@ -35,6 +48,25 @@ const PLATFORM_Y_BOTTOM: f32 = 0.32;
 const PLATFORM_X0: f32 = 0.1;
 const PLATFORM_X1: f32 = 0.5;
 const GOAL_X: f32 = 0.85;
+
+const BOSS_X: f32 = 0.65;
+const BOSS_HALF: f32 = 0.09;
+const BOSS_MAX_HP: f32 = 1.0;
+const MAX_FIREBALLS: usize = 4;
+const FIREBALL_SPEED: f32 = 0.03;
+const FIREBALL_COOLDOWN_FRAMES: u32 = 18;
+const FIREBALL_DAMAGE: f32 = 0.2;
+
+#[derive(Clone, Copy)]
+struct Fireball {
+    active: bool,
+    x: f32,
+    y: f32,
+}
+
+impl Fireball {
+    const INACTIVE: Fireball = Fireball { active: false, x: 0.0, y: 0.0 };
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -61,6 +93,11 @@ struct GameState {
     right_held: bool,
     jump_held: bool,
     clears: u32,
+    fire_held: bool,
+    fire_cooldown: u32,
+    fireballs: [Fireball; MAX_FIREBALLS],
+    boss_hp: f32,
+    boss_defeats: u32,
 }
 
 impl GameState {
@@ -74,6 +111,11 @@ impl GameState {
             right_held: false,
             jump_held: false,
             clears: 0,
+            fire_held: false,
+            fire_cooldown: 0,
+            fireballs: [Fireball::INACTIVE; MAX_FIREBALLS],
+            boss_hp: BOSS_MAX_HP,
+            boss_defeats: 0,
         }
     }
 
@@ -112,17 +154,56 @@ impl GameState {
             }
         }
 
-        // ゴール到達判定。
-        if (self.player_x - GOAL_X).abs() < PLAYER_HALF + 0.05 && self.player_y < GROUND_TOP - 0.01 {
-            self.clears += 1;
-            println!("CLEAR! (total={})", self.clears);
-            self.player_x = -0.85;
-            self.player_y = GROUND_TOP - PLAYER_HALF;
-            self.vel_y = 0.0;
-            self.on_ground = true;
+        self.jump_held = false;
+
+        // 火の玉の発射(Fキー)。クールダウン中・空きスロットが無ければ無視。
+        if self.fire_held && self.fire_cooldown == 0 {
+            if let Some(slot) = self.fireballs.iter_mut().find(|f| !f.active) {
+                *slot = Fireball { active: true, x: self.player_x + PLAYER_HALF, y: self.player_y };
+                self.fire_cooldown = FIREBALL_COOLDOWN_FRAMES;
+            }
+        }
+        self.fire_cooldown = self.fire_cooldown.saturating_sub(1);
+
+        // 火の玉の飛行とボスへの命中判定。
+        let boss_y = GROUND_TOP - BOSS_HALF;
+        for fireball in self.fireballs.iter_mut() {
+            if !fireball.active {
+                continue;
+            }
+            fireball.x += FIREBALL_SPEED;
+            if fireball.x > 1.0 {
+                fireball.active = false;
+                continue;
+            }
+            let dx = (fireball.x - BOSS_X).abs();
+            let dy = (fireball.y - boss_y).abs();
+            if self.boss_hp > 0.0 && dx < BOSS_HALF && dy < BOSS_HALF {
+                fireball.active = false;
+                self.boss_hp = (self.boss_hp - FIREBALL_DAMAGE).max(0.0);
+                if self.boss_hp <= 0.0 {
+                    self.boss_defeats += 1;
+                    println!("ボス撃破! (total={})", self.boss_defeats);
+                } else {
+                    println!("ボスに火の玉が命中! (残りHP: {:.0}%)", self.boss_hp * 100.0);
+                }
+            }
         }
 
-        self.jump_held = false;
+        // ボスを倒すとゴールできる想定(倒す前はゴールできない、という
+        // Phase 0の簡易ルール)。撃破後は次周のためHPを回復させる。
+        if self.boss_hp <= 0.0 {
+            // ゴール到達判定。
+            if (self.player_x - GOAL_X).abs() < PLAYER_HALF + 0.05 && self.player_y < GROUND_TOP - 0.01 {
+                self.clears += 1;
+                println!("CLEAR! (total={})", self.clears);
+                self.player_x = -0.85;
+                self.player_y = GROUND_TOP - PLAYER_HALF;
+                self.vel_y = 0.0;
+                self.on_ground = true;
+                self.boss_hp = BOSS_MAX_HP;
+            }
+        }
     }
 
     fn player_dest_ndc(&self) -> [f32; 4] {
@@ -137,6 +218,25 @@ impl GameState {
     fn goal_dest_ndc(&self) -> [f32; 4] {
         [GOAL_X - 0.03, GROUND_TOP - 0.35, GOAL_X + 0.03, GROUND_TOP]
     }
+    fn boss_dest_ndc(&self) -> [f32; 4] {
+        if self.boss_hp <= 0.0 {
+            // 撃破後は次に倒すまで画面外へ(HP回復後は再表示)。
+            return [-2.0, -2.0, -1.9, -1.9];
+        }
+        let y = GROUND_TOP - BOSS_HALF;
+        [BOSS_X - BOSS_HALF, y - BOSS_HALF, BOSS_X + BOSS_HALF, y + BOSS_HALF]
+    }
+    fn boss_hp_bar_ndc(&self) -> [f32; 4] {
+        let w = 0.3 * (self.boss_hp / BOSS_MAX_HP);
+        [-0.15 - w, -0.95, -0.15 + w, -0.9]
+    }
+    fn fireball_dest_ndc(&self, i: usize) -> [f32; 4] {
+        let f = &self.fireballs[i];
+        if !f.active {
+            return [-2.0, -2.0, -1.9, -1.9];
+        }
+        [f.x - 0.025, f.y - 0.025, f.x + 0.025, f.y + 0.025]
+    }
 }
 
 fn main() {
@@ -146,6 +246,11 @@ fn main() {
         .with_inner_size(winit::dpi::LogicalSize::new(WIDTH, HEIGHT))
         .build(&event_loop)
         .expect("create window");
+
+    // BGM再生ハンドルはイベントループが動いている間ずっと保持する
+    // (dropすると再生が止まるため、ここで`main`のスコープに留める。
+    // `event_loop.run`は戻らないため、事実上プロセス終了までスコープに残る)。
+    let _bgm = audio::play_bgm_loop();
 
     let mut renderer = unsafe { Renderer::new(&window) }.expect("create Vulkan renderer");
     let mut state = GameState::new();
@@ -162,6 +267,7 @@ fn main() {
                     Some(VirtualKeyCode::Left) | Some(VirtualKeyCode::A) => state.left_held = pressed,
                     Some(VirtualKeyCode::Right) | Some(VirtualKeyCode::D) => state.right_held = pressed,
                     Some(VirtualKeyCode::Space) | Some(VirtualKeyCode::Up) if pressed => state.jump_held = true,
+                    Some(VirtualKeyCode::F) => state.fire_held = pressed,
                     Some(VirtualKeyCode::Escape) => *control_flow = ControlFlow::Exit,
                     _ => {}
                 }
@@ -200,6 +306,9 @@ struct Renderer {
     platform_descriptor_set: vk::DescriptorSet,
     player_descriptor_set: vk::DescriptorSet,
     goal_descriptor_set: vk::DescriptorSet,
+    boss_descriptor_set: vk::DescriptorSet,
+    boss_hp_descriptor_set: vk::DescriptorSet,
+    fireball_descriptor_set: vk::DescriptorSet,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
     command_pool: vk::CommandPool,
@@ -211,10 +320,18 @@ struct Renderer {
     _platform_texture_image: vk::Image,
     _player_texture_image: vk::Image,
     _goal_texture_image: vk::Image,
+    _boss_texture_image: vk::Image,
+    _boss_hp_texture_image: vk::Image,
+    _fireball_texture_image: vk::Image,
     sampler: vk::Sampler,
 }
 
-const SPRITE_COUNT: usize = 4;
+/// 固定スプライト(地面・足場・自機・ゴール旗・ボス・ボスHPバー)
+/// +火の玉`MAX_FIREBALLS`発を毎フレーム描画する。
+const FIXED_SPRITE_COUNT: usize = 6;
+const DRAWN_SPRITE_COUNT: usize = FIXED_SPRITE_COUNT + MAX_FIREBALLS;
+/// 一意のテクスチャ数(固定6種+火の玉)。
+const TEXTURE_COUNT: usize = FIXED_SPRITE_COUNT + 1;
 const VERTS_PER_SPRITE: usize = 6;
 
 impl Renderer {
@@ -348,6 +465,10 @@ impl Renderer {
         let (platform_image, platform_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 150, g: 100, b: 40, a: 255 })?;
         let (player_image, player_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 220, g: 30, b: 30, a: 255 })?;
         let (goal_image, goal_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 240, g: 220, b: 30, a: 255 })?;
+        // ボス(甲羅の魔竜王、独自デザイン)=深緑、HPバー=赤、火の玉=橙。
+        let (boss_image, boss_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 40, g: 110, b: 60, a: 255 })?;
+        let (boss_hp_image, boss_hp_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 220, g: 50, b: 50, a: 255 })?;
+        let (fireball_image, fireball_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 255, g: 130, b: 20, a: 255 })?;
 
         let sampler_info = vk::SamplerCreateInfo::builder().mag_filter(vk::Filter::NEAREST).min_filter(vk::Filter::NEAREST);
         let sampler = device.create_sampler(&sampler_info, None).map_err(|e| e.to_string())?;
@@ -362,21 +483,32 @@ impl Renderer {
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&dsl_bindings);
         let descriptor_set_layout = device.create_descriptor_set_layout(&dsl_info, None).map_err(|e| e.to_string())?;
 
-        let pool_size = vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: SPRITE_COUNT as u32 };
+        let pool_size = vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: TEXTURE_COUNT as u32 };
         let pool_sizes = [pool_size];
-        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder().pool_sizes(&pool_sizes).max_sets(SPRITE_COUNT as u32);
+        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder().pool_sizes(&pool_sizes).max_sets(TEXTURE_COUNT as u32);
         let descriptor_pool = device.create_descriptor_pool(&descriptor_pool_info, None).map_err(|e| e.to_string())?;
 
-        let set_layouts = vec![descriptor_set_layout; SPRITE_COUNT];
+        let set_layouts = vec![descriptor_set_layout; TEXTURE_COUNT];
         let ds_alloc_info = vk::DescriptorSetAllocateInfo::builder().descriptor_pool(descriptor_pool).set_layouts(&set_layouts);
         let sets = device.allocate_descriptor_sets(&ds_alloc_info).map_err(|e| e.to_string())?;
-        let (ground_descriptor_set, platform_descriptor_set, player_descriptor_set, goal_descriptor_set) = (sets[0], sets[1], sets[2], sets[3]);
+        let (
+            ground_descriptor_set,
+            platform_descriptor_set,
+            player_descriptor_set,
+            goal_descriptor_set,
+            boss_descriptor_set,
+            boss_hp_descriptor_set,
+            fireball_descriptor_set,
+        ) = (sets[0], sets[1], sets[2], sets[3], sets[4], sets[5], sets[6]);
 
         for (set, view) in [
             (ground_descriptor_set, ground_view),
             (platform_descriptor_set, platform_view),
             (player_descriptor_set, player_view),
             (goal_descriptor_set, goal_view),
+            (boss_descriptor_set, boss_view),
+            (boss_hp_descriptor_set, boss_hp_view),
+            (fireball_descriptor_set, fireball_view),
         ] {
             let image_info = vk::DescriptorImageInfo::builder()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -393,7 +525,7 @@ impl Renderer {
             device.update_descriptor_sets(&[write], &[]);
         }
 
-        let vbuf_size = ((SPRITE_COUNT * VERTS_PER_SPRITE) * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
+        let vbuf_size = ((DRAWN_SPRITE_COUNT * VERTS_PER_SPRITE) * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
         let (vertex_buffer, vertex_buffer_memory) =
             create_host_visible_buffer(&device, &memory_properties, vbuf_size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
 
@@ -494,6 +626,9 @@ impl Renderer {
             platform_descriptor_set,
             player_descriptor_set,
             goal_descriptor_set,
+            boss_descriptor_set,
+            boss_hp_descriptor_set,
+            fireball_descriptor_set,
             vertex_buffer,
             vertex_buffer_memory,
             command_pool,
@@ -505,6 +640,9 @@ impl Renderer {
             _platform_texture_image: platform_image,
             _player_texture_image: player_image,
             _goal_texture_image: goal_image,
+            _boss_texture_image: boss_image,
+            _boss_hp_texture_image: boss_hp_image,
+            _fireball_texture_image: fireball_image,
             sampler,
         })
     }
@@ -519,15 +657,21 @@ impl Renderer {
         };
         self.device.reset_fences(&[self.in_flight]).expect("reset_fences");
 
-        let ground_verts = quad_vertices(state.ground_dest_ndc());
-        let platform_verts = quad_vertices(state.platform_dest_ndc());
-        let player_verts = quad_vertices(state.player_dest_ndc());
-        let goal_verts = quad_vertices(state.goal_dest_ndc());
-        let mut all_verts = [Vertex { pos: [0.0; 3], uv: [0.0; 2] }; SPRITE_COUNT * VERTS_PER_SPRITE];
-        all_verts[0..6].copy_from_slice(&ground_verts);
-        all_verts[6..12].copy_from_slice(&platform_verts);
-        all_verts[12..18].copy_from_slice(&player_verts);
-        all_verts[18..24].copy_from_slice(&goal_verts);
+        let mut sprites_ndc = [[0.0f32; 4]; DRAWN_SPRITE_COUNT];
+        sprites_ndc[0] = state.ground_dest_ndc();
+        sprites_ndc[1] = state.platform_dest_ndc();
+        sprites_ndc[2] = state.player_dest_ndc();
+        sprites_ndc[3] = state.goal_dest_ndc();
+        sprites_ndc[4] = state.boss_dest_ndc();
+        sprites_ndc[5] = state.boss_hp_bar_ndc();
+        for i in 0..MAX_FIREBALLS {
+            sprites_ndc[FIXED_SPRITE_COUNT + i] = state.fireball_dest_ndc(i);
+        }
+        let mut all_verts = [Vertex { pos: [0.0; 3], uv: [0.0; 2] }; DRAWN_SPRITE_COUNT * VERTS_PER_SPRITE];
+        for (i, ndc) in sprites_ndc.iter().enumerate() {
+            let verts = quad_vertices(*ndc);
+            all_verts[i * VERTS_PER_SPRITE..(i + 1) * VERTS_PER_SPRITE].copy_from_slice(&verts);
+        }
         let vbuf_size = std::mem::size_of_val(&all_verts) as vk::DeviceSize;
         let ptr = self.device.map_memory(self.vertex_buffer_memory, 0, vbuf_size, vk::MemoryMapFlags::empty()).expect("map vertex buffer");
         std::ptr::copy_nonoverlapping(all_verts.as_ptr() as *const u8, ptr as *mut u8, vbuf_size as usize);
@@ -548,14 +692,19 @@ impl Renderer {
         self.device.cmd_bind_pipeline(self.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         self.device.cmd_bind_vertex_buffers(self.command_buffer, 0, &[self.vertex_buffer], &[0]);
 
-        for (set, first_vertex) in [
-            (self.ground_descriptor_set, 0),
-            (self.platform_descriptor_set, 6),
-            (self.player_descriptor_set, 12),
-            (self.goal_descriptor_set, 18),
-        ] {
+        let mut sets = [self.ground_descriptor_set; DRAWN_SPRITE_COUNT];
+        sets[0] = self.ground_descriptor_set;
+        sets[1] = self.platform_descriptor_set;
+        sets[2] = self.player_descriptor_set;
+        sets[3] = self.goal_descriptor_set;
+        sets[4] = self.boss_descriptor_set;
+        sets[5] = self.boss_hp_descriptor_set;
+        for i in 0..MAX_FIREBALLS {
+            sets[FIXED_SPRITE_COUNT + i] = self.fireball_descriptor_set;
+        }
+        for (i, &set) in sets.iter().enumerate() {
             self.device.cmd_bind_descriptor_sets(self.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, 0, &[set], &[]);
-            self.device.cmd_draw(self.command_buffer, 6, 1, first_vertex, 0);
+            self.device.cmd_draw(self.command_buffer, VERTS_PER_SPRITE as u32, 1, (i * VERTS_PER_SPRITE) as u32, 0);
         }
 
         self.device.cmd_end_render_pass(self.command_buffer);
