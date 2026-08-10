@@ -36,6 +36,7 @@
 
 mod audio;
 mod font;
+mod sprite;
 
 use std::ffi::CString;
 
@@ -567,13 +568,16 @@ impl Renderer {
 
         let (ground_image, ground_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 30, g: 140, b: 40, a: 255 })?;
         let (platform_image, platform_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 150, g: 100, b: 40, a: 255 })?;
-        let (player_image, player_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 220, g: 30, b: 30, a: 255 })?;
+        let (player_image, player_view) =
+            create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &sprite::rasterize(sprite::PLAYER, sprite::player_palette, 3))?;
         let (goal_image, goal_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 240, g: 220, b: 30, a: 255 })?;
-        // ボス(甲羅の魔竜王、独自デザイン)=深緑、HPバー=赤、火の玉=橙。
-        let (boss_image, boss_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 40, g: 110, b: 60, a: 255 })?;
+        // ボス(甲羅の魔竜王、独自デザイン)、HPバー=赤、火の玉=橙。
+        let (boss_image, boss_view) =
+            create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &sprite::rasterize(sprite::BOSS, sprite::boss_palette, 3))?;
         let (boss_hp_image, boss_hp_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 220, g: 50, b: 50, a: 255 })?;
         let (fireball_image, fireball_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 255, g: 130, b: 20, a: 255 })?;
-        let (turtle_image, turtle_view) = create_solid_texture(&device, &memory_properties, queue, queue_family_index, Rgba8 { r: 60, g: 170, b: 70, a: 255 })?;
+        let (turtle_image, turtle_view) =
+            create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &sprite::rasterize(sprite::TURTLE, sprite::turtle_palette, 3))?;
         let hud_texture = font::render_text_banner(HUD_TEXT, 3, Rgba8 { r: 255, g: 255, b: 255, a: 255 }, Rgba8 { r: 10, g: 10, b: 15, a: 255 });
         let (hud_image, hud_view) = create_texture_from_rgba(&device, &memory_properties, queue, queue_family_index, &hud_texture)?;
 
