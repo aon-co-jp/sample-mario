@@ -1,3 +1,5 @@
+> Latest translations / 翻訳の最新版: [0-LATEST-TRANSLATIONS.md](0-LATEST-TRANSLATIONS.md)
+
 # sample-mario
 
 マリオ風2Dプラットフォーマーのショートゲームプロトタイプ。
