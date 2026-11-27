@@ -1,3 +1,3 @@
 source: aon-co-jp/sample-mario
-commit: e5276b6952dbc9b9ebeecbaea5edb6f812a38a59
-updated: 2026-11-27T06:13:19Z
+commit: c32b432e05e61ebbdf02eb8b8486a982d14a6da6
+updated: 2026-11-27T06:15:43Z
